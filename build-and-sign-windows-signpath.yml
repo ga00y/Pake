@@ -1,0 +1,125 @@
+name: build-and-sign-windows-signpath
+
+# 前提（缺一条 SignPath 都会拒签或拒批）：
+#   1. 本仓库必须是 tw93/Pake 的 GitHub fork（用 Fork 按钮生成），并在根目录加了 app/MarkdownEditor.json；
+#      SignPath 条款要求「只签自己源码构建的产物」，从 fork 构建即满足「visibly uses a fork」。
+#   2. 构建必须跑在 GitHub 官方 runner 上（本文件已用 windows-latest，满足）。
+#   3. Secrets：SIGNPATH_API_TOKEN / VALUE_SIGNPATH_ORG_ID / VALUE_SIGNPATH_PROJECT_SLUG / VALUE_SIGNPATH_POLICY_SLUG
+#      （后三个在 SignPath 「Create code signing job」页面能直接查到，见 README）
+#   4. 每个签名请求要在 SignPath 控制台由 Approver 人工批准一次，不是全自动。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-sign-and-package:
+    runs-on: windows-latest
+    env:
+      PAKE_USE_CN_MIRROR: "1" # rsproxy/cnpm 在 GitHub runner 上未必更快，被墙时可自行删除
+      APP_NAME: MarkdownEditor
+      APP_VERSION: 1.0.0
+    steps:
+      - name: Checkout (your Pake fork)
+        uses: actions/checkout@v4
+
+      - name: Sanity check - is this really a fork?
+        shell: pwsh
+        run: |
+          $repo = "${{ github.repository }}"
+          Write-Host "repo=$repo"
+          if ($repo -notmatch '/') { throw "unexpected repository name" }
+          if (-not (Test-Path app/MarkdownEditor.json)) { throw "缺少 app/MarkdownEditor.json（把 output 里的 app.json 改名放进来）" }
+          if (-not (Test-Path src-tauri)) { throw "这不是 Pake 仓库，缺少 src-tauri 目录" }
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Enable pnpm (version pinned in package.json packageManager)
+        shell: pwsh
+        run: |
+          corepack enable
+          pnpm --version
+
+      - name: Install dependencies and build the Pake CLI
+        shell: pwsh
+        run: |
+          pnpm install
+          pnpm run cli:build
+          if (-not (Test-Path dist/cli.js)) { throw "dist/cli.js 未生成" }
+
+      - name: Build the app with the fork-local CLI
+        shell: bash
+        run: |
+          set +e
+          # 在仓库检出内必须用 node dist/cli.js（技能文档规定），不能用全局 pake-cli
+          node dist/cli.js --config app/MarkdownEditor.json --keep-binary --json > result.json 2> build.log
+          code=$?
+          set -e
+          echo "----- build.log -----"; cat build.log || true
+          echo "----- result.json -----"; cat result.json || true
+          echo "exit_code=$code"
+          if [ "$code" -ne 0 ]; then
+            # 0 成功 / 2 参数错 / 3 构建失败 / 4 环境或依赖缺失 / 1 意外
+            echo "::error::pake 构建失败（exit $code）。exit 3 时在 app/MarkdownEditor.json 加 \"debug\": true 重跑取详细日志。"
+            exit "$code"
+          fi
+          ls -la "$APP_NAME.exe" "$APP_NAME.msi"
+
+      # SignPath 只接受先进过 GitHub Actions artifact 存储的产物，因此顺序是
+      # upload-unsigned -> submit signing request -> download signed
+      - name: Upload unsigned artifact
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-${{ env.APP_NAME }}
+          path: ${{ env.APP_NAME }}.exe
+          retention-days: 1
+
+      - name: Submit SignPath signing request
+        id: sign
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: "${{ secrets.SIGNPATH_API_TOKEN }}"
+          organization-id: "${{ secrets.VALUE_SIGNPATH_ORG_ID }}"
+          project-slug: "${{ secrets.VALUE_SIGNPATH_PROJECT_SLUG }}"
+          signing-policy-slug: "${{ secrets.VALUE_SIGNPATH_POLICY_SLUG }}"
+          github-artifact-id: "${{ steps.upload-unsigned.outputs.artifact-id }}"
+          wait-for-completion: true
+          output-artifact-directory: ./signed
+          # 人工批准要等：默认 600s 不够，这里给 1 小时；不想等可改 wait-for-completion: false，事后去 SignPath 下载
+          wait-for-completion-timeout-in-seconds: "3600"
+          # 只有当 SignPath 的 artifact 配置里定义了名为 version 的用户参数时才保留下面两行，
+          # 否则多余参数会让签名请求失败，请整段删除
+          parameters: |
+            version: "${{ env.APP_VERSION }}"
+
+      - name: Verify signature and package
+        shell: pwsh
+        run: |
+          $signed = Get-ChildItem ./signed -Recurse -Filter "$env:APP_NAME.exe" | Select-Object -First 1
+          if (-not $signed) { Write-Host "signed 目录内容："; Get-ChildItem ./signed -Recurse | Format-Table FullName; throw "未取回签名后的 exe" }
+          Get-AuthenticodeSignature $signed.FullName | Format-List Status, StatusMessage, SignerCertificate
+          if ((Get-AuthenticodeSignature $signed.FullName).Status -ne 'Valid') { throw "签名校验未通过" }
+          Copy-Item $signed.FullName ./$env:APP_NAME.exe -Force
+          if (Test-Path "./$env:APP_NAME.msi") {
+            # MSI 也建议单独走一条 SignPath artifact 配置；这里先随包一起产出
+            Write-Host "::notice::MarkdownEditor.msi 未签名（需要 SignPath 里再建一个 artifact 配置）"
+          }
+          Compress-Archive -Path ./$env:APP_NAME.exe -DestinationPath ("./" + $env:APP_NAME + "-win-x64-signed-portable.zip") -Force
+          "signing-request: ${{ steps.sign.outputs.signing-request-web-url }}" | Out-File -Append ./build-summary.md
+          "signed exe: $((Get-Item ./$env:APP_NAME.exe).Length) bytes" | Out-File -Append ./build-summary.md
+
+      - name: Upload signed portable exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-win-x64-signed-portable
+          path: ${{ env.APP_NAME }}-win-x64-signed-portable.zip
+          if-no-files-found: error
+
+      - name: Summary
+        run: Get-Content ./build-summary.md | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append

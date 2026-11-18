@@ -1,0 +1,101 @@
+name: build-markdown-editor-windows
+
+# 在 GitHub Actions 的 Windows runner 上，用 Pake 把
+# https://markdown.com.cn/editor/ 打包成免安装exe（MarkdownEditor.exe）。
+# 手动触发：Actions -> Build Markdown Editor (Windows) -> Run workflow
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - app.json
+      - .github/workflows/build-windows.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      # Rust 走 rsproxy.cn、npm 走 npmmirror，国内首次构建明显更快（Pake 官方支持）
+      PAKE_USE_CN_MIRROR: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Show the target page before building
+        run: curl.exe -sSI https://markdown.com.cn/editor/ | Select-Object -First 5
+
+      - name: Install Pake CLI
+        run: npm install -g pake-cli --no-fund --no-audit
+
+      - name: Build (portable exe + msi)
+        shell: bash
+        run: |
+          set +e
+          # --json: stdout 只有一个 JSON 结果对象，日志进 stderr（--keep-binary 已写在 app.json 里）
+          pake --config "$GITHUB_WORKSPACE/app.json" --json > result.json 2> build.log
+          code=$?
+          set -e
+          echo "----- build.log -----"; cat build.log
+          echo "----- result.json -----"; cat result.json
+          echo "exit_code=$code"
+          # Pake 退出码：0 成功 / 2 参数错 / 3 构建失败 / 4 环境缺依赖 / 1 意外
+          if [ "$code" -ne 0 ]; then
+            echo "::error::pake 构建失败（exit $code）。若为 3，把 app.json 加 \"debug\": true 重跑看详细日志。"
+            exit "$code"
+          fi
+          test -f MarkdownEditor.exe || { echo "::error::没找到 MarkdownEditor.exe"; ls -la; exit 1; }
+          ls -la MarkdownEditor.exe MarkdownEditor.msi
+
+      - name: Sign artifacts (optional — skipped unless company certificate secrets are set)
+        env:
+          # 需要两个仓库 secrets（Settings -> Secrets and variables -> Actions）：
+          #   CODESIGN_PFX_B64      证书 PFX 的 Base64（公司内部 CA 签发的代码签名证书）
+          #   CODESIGN_PFX_PASSWORD 该 PFX 的导出密码
+          # 都留空时自动跳过，不影响无签名构建。
+          CODESIGN_PFX_B64: ${{ secrets.CODESIGN_PFX_B64 }}
+          CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
+        shell: pwsh
+        run: |
+          if (-not $env:CODESIGN_PFX_B64) {
+            Write-Host "::notice::未设置 CODESIGN_PFX_B64，跳过签名（产物保持未签名）"
+            exit 0
+          }
+          $ErrorActionPreference = "Stop"
+          [IO.File]::WriteAllBytes("$PWD/codesign.pfx", [Convert]::FromBase64String($env:CODESIGN_PFX_B64))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match '\\x64\\' } |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          Write-Host "signtool: $signtool"
+          $ts = "http://timestamp.digicert.com"
+          & $signtool sign /fd SHA256 /td SHA256 /tr $ts /f codesign.pfx /p "$env:CODESIGN_PFX_PASSWORD" MarkdownEditor.exe
+          & $signtool sign /fd SHA256 /td SHA256 /tr $ts /f codesign.pfx /p "$env:CODESIGN_PFX_PASSWORD" MarkdownEditor.msi
+          # runner 不在公司域内，内部 CA 证书链可能验不全：这里只展示签名状态，不判失败
+          Get-AuthenticodeSignature MarkdownEditor.exe, MarkdownEditor.msi |
+            Format-Table Status, StatusMessage, SignerCertificate -AutoSize
+          Remove-Item codesign.pfx -Force
+
+      - name: Zip the portable build
+        shell: pwsh
+        run: |
+          Compress-Archive -Path MarkdownEditor.exe -DestinationPath MarkdownEditor-win-x64-portable.zip -Force
+          Get-Item MarkdownEditor-win-x64-portable.zip | Select-Object Name, Length
+
+      - name: Upload portable exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: MarkdownEditor-win-x64-portable
+          path: MarkdownEditor-win-x64-portable.zip
+          if-no-files-found: error
+
+      - name: Upload the installer as a fallback
+        uses: actions/upload-artifact@v4
+        with:
+          name: MarkdownEditor-win-x64-msi
+          path: MarkdownEditor.msi
+          if-no-files-found: ignore
