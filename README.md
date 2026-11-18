@@ -9,9 +9,9 @@ Free code signing provided by [SignPath.io](https://about.signpath.io), certific
 
 ### Binaries we sign with this policy
 
-| Application           | Publisher                                                        |
-| --------------------- | ---------------------------------------------------------------- |
-| `MarkdownEditor.exe`  | Free code signing provided by SignPath.io, certificate by SignPath Foundation |
+| Application          | Publisher                                                                     |
+| -------------------- | ----------------------------------------------------------------------------- |
+| `MarkdownEditor.exe` | Free code signing provided by SignPath.io, certificate by SignPath Foundation |
 
 `MarkdownEditor.exe` is built by this repository's GitHub Actions workflow
 (`.github/workflows/build-and-sign-windows-signpath.yml`) on a GitHub-hosted
