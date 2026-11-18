@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tw93/Pake/main/schema/pake.schema.json",
+  "url": "https://markdown.com.cn/editor/",
+  "name": "MarkdownEditor",
+  "identifier": "com.pake.mdeditor",
+  "title": "Markdown 编辑器",
+  "width": 1440,
+  "height": 900,
+  "minWidth": 760,
+  "minHeight": 520,
+  "enableFind": true,
+  "keepBinary": true,
+  "appVersion": "1.0.0"
+}
