@@ -1,0 +1,183 @@
+name: build-markdown-editor
+
+# 一个文件两用：
+#   · 没有配置 SIGNPATH_API_TOKEN -> 只产出未签名的 MarkdownEditor.exe / .msi（用于先建 GitHub Release）
+#   · 配好 4 个 SIGNPATH_* secrets 后 -> 构建完自动提交 SignPath 签名请求，回来校验签名再打包
+# 手动触发：Actions -> Build Markdown Editor -> Run workflow
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - app/MarkdownEditor.json
+      - app.json
+      - .github/workflows/build.yml
+
+permissions:
+  contents: read
+
+env:
+  PAKE_USE_CN_MIRROR: "1"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the app
+        id: build
+        shell: bash
+        run: |
+          set -uo pipefail
+          # 一律用相对路径：Windows runner 上 bash 的 $PWD 是 /d/a/... 形式，
+          # Windows 版 Node 解析不了，会被 pake 报成 "Config file not found"。
+          echo "cwd=$(pwd)"
+          CONFIG=""
+          for c in app/MarkdownEditor.json app.json; do
+            if [ -f "$c" ]; then CONFIG="$c"; break; fi
+          done
+          if [ -z "$CONFIG" ]; then
+            echo "::error::找不到 app/MarkdownEditor.json（也没有根目录 app.json）——检查文件名大小写与所在分支"
+            ls -la
+            [ -d app ] && ls -la app
+            exit 1
+          fi
+          PAIR=$(node -e 'const c=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log((c.name||"")+"|"+(c.appVersion||"1.0.0"))' "$CONFIG")
+          NAME=${PAIR%%|*}
+          VER=${PAIR##*|}
+          if [ -z "$NAME" ]; then
+            echo "::error::配置文件里没有 name 字段：$CONFIG"
+            exit 1
+          fi
+          echo "APP_NAME=$NAME" >> "$GITHUB_ENV"
+          echo "APP_VERSION=$VER" >> "$GITHUB_ENV"
+          echo "config=$CONFIG name=$NAME version=$VER"
+
+          if [ -d src-tauri ]; then
+            echo "构建模式：本仓库源码（fork）"
+            corepack enable
+            pnpm install
+            pnpm run cli:build
+            LAUNCH="node dist/cli.js"
+          else
+            echo "构建模式：发布版 pake-cli"
+            npm install -g pake-cli --no-fund --no-audit
+            LAUNCH="pake"
+          fi
+
+          $LAUNCH --config "$CONFIG" --json > result.json 2> build.log
+          code=$?
+          echo "----- build.log -----"; cat build.log || true
+          echo "----- result.json -----"; cat result.json || true
+          { echo "exit_code=$code"; echo; echo "--- build.log ---"; cat build.log 2>/dev/null; echo; echo "--- result.json ---"; cat result.json 2>/dev/null; } > pake-diagnostics.txt
+          if [ "$code" -ne 0 ]; then
+            msg=$(node -e 'try{const r=require("./result.json");if(r&&r.error)console.log(r.error.code+": "+r.error.message+" | hint: "+(r.error.hint||""))}catch(e){}' 2>/dev/null)
+            echo "::error::pake 失败 exit=$code ${msg:-（result.json 无 error 字段，下载 pake-diagnostics 附件看全文）}"
+            exit "$code"
+          fi
+          ls -la "$NAME".exe || ls -la
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pake-diagnostics
+          path: pake-diagnostics.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Package the unsigned portable build
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "./$env:APP_NAME.exe" -DestinationPath ("./" + $env:APP_NAME + "-win-x64-portable.zip") -Force
+          Get-ChildItem "$env:APP_NAME*" | Select-Object Name, Length
+
+      - name: Upload unsigned portable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: markdown-editor-win-x64-unsigned
+          path: ${{ env.APP_NAME }}-win-x64-portable.zip
+
+      - name: Upload unsigned msi
+        uses: actions/upload-artifact@v4
+        with:
+          name: markdown-editor-win-x64-msi
+          path: ${{ env.APP_NAME }}.msi
+          if-no-files-found: ignore
+
+      - name: Check whether SignPath is configured
+        id: sp
+        env:
+          TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        shell: bash
+        run: |
+          if [ -n "${TOKEN:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "检测到 SIGNPATH_API_TOKEN，本次会提交签名请求"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "未配置 SIGNPATH_API_TOKEN，本次只产出未签名包"
+          fi
+
+      - name: Upload artifact for signing
+        if: steps.sp.outputs.enabled == 'true'
+        id: unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: to-sign
+          path: ${{ env.APP_NAME }}.exe
+          retention-days: 1
+
+      - name: Submit SignPath signing request
+        if: steps.sp.outputs.enabled == 'true'
+        id: sign
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORG_ID }}
+          project-slug: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ secrets.SIGNPATH_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          # 等待人工批准，最多 1 小时；错过可去 SignPath 网站手动下载签名包
+          wait-for-completion-timeout-in-seconds: "3600"
+          output-artifact-directory: ./signed
+          # 若 SignPath 报「未知参数 version」，说明该 artifact 配置没定义用户参数，删掉下面两行即可
+          parameters: |
+            version: "${{ env.APP_VERSION }}"
+
+      - name: Verify the signature and package it
+        if: steps.sp.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $signed = Get-ChildItem ./signed -Recurse -Filter "$env:APP_NAME.exe" | Select-Object -First 1
+          if (-not $signed) {
+            Get-ChildItem ./signed -Recurse | Format-Table FullName
+            throw "SignPath 没返回 $env:APP_NAME.exe，检查 artifact 配置的路径匹配"
+          }
+          Get-AuthenticodeSignature $signed.FullName | Format-List Status, StatusMessage, SignerCertificate
+          if ((Get-AuthenticodeSignature $signed.FullName).Status -ne 'Valid') { throw "签名校验失败" }
+          Copy-Item $signed.FullName ./$env:APP_NAME.exe -Force
+          Compress-Archive -Path ./$env:APP_NAME.exe -DestinationPath ("./" + $env:APP_NAME + "-win-x64-signed-portable.zip") -Force
+
+      - name: Upload signed portable zip
+        if: steps.sp.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: markdown-editor-win-x64-signed
+          path: ${{ env.APP_NAME }}-win-x64-signed-portable.zip
+
+      - name: Write job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## MarkdownEditor ${APP_VERSION}"
+            echo
+            echo "- 构建：$( [ "${{ steps.sp.outputs.enabled }}" = 'true' ] && echo '已提交 SignPath 签名' || echo '未签名' )"
+            echo "- 产物：artifact \`markdown-editor-win-x64-unsigned\`$( [ "${{ steps.sp.outputs.enabled }}" = 'true' ] && echo ' 与 \`markdown-editor-win-x64-signed\`' )"
+            echo
+            echo "exe 依赖 Edge WebView2 Runtime；首次运行 SmartScreen 仍可能提示一次。"
+          } >> "$GITHUB_STEP_SUMMARY"
